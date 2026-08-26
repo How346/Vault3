@@ -16,6 +16,14 @@
         android:label="Wallet"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
+        <!-- OneSignal default notification icons. The small icon is the app logo
+             rendered as an Android-compliant monochrome notification glyph. -->
+        <meta-data
+            android:name="com.onesignal.messaging.default_notification_icon"
+            android:resource="@drawable/ic_stat_onesignal_default" />
+        <meta-data
+            android:name="com.onesignal.messaging.default_notification_accent_color"
+            android:resource="@color/notification_accent" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
