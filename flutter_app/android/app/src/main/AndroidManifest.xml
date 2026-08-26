@@ -13,17 +13,23 @@
 
     <application
         android:usesCleartextTraffic="true"
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:label="Wallet"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
-        <!-- OneSignal default notification icons. The small icon is the app logo
-             rendered as an Android-compliant monochrome notification glyph. -->
+        <!-- Small notification icons are a monochrome bell as required by Android.
+             The launcher/app logo remains available as the large icon. -->
         <meta-data
             android:name="com.onesignal.messaging.default_notification_icon"
             android:resource="@drawable/ic_stat_onesignal_default" />
         <meta-data
             android:name="com.onesignal.messaging.default_notification_accent_color"
             android:resource="@color/notification_accent" />
+        <meta-data
+            android:name="com.onesignal.messaging.default_notification_large_icon"
+            android:resource="@drawable/ic_onesignal_large_icon_default" />
         <activity
             android:name=".MainActivity"
             android:exported="true"

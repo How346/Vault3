@@ -23,6 +23,7 @@ class SettingsKeys {
 class SecureKeys {
   static const pinHash = 'pin_hash';
   static const pinSalt = 'pin_salt';
+  static const pinKdfVersion = 'pin_kdf_version';
 }
 
 /// Categories that always exist and cannot be deleted.

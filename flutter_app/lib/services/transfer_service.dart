@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 import 'dart:typed_data';
 
 import 'package:archive/archive.dart';
@@ -15,6 +16,9 @@ import '../utils/constants.dart';
 import 'storage_service.dart';
 
 const int kTransferPort = 47653;
+const int kMaxTransferBytes = 1024 * 1024 * 1024; // 1 GiB safety ceiling.
+const int kMaxAuthFailures = 6;
+const Duration kAuthBlockDuration = Duration(seconds: 20);
 
 class TransferException implements Exception {
   TransferException(this.message);
@@ -32,6 +36,10 @@ class TransferService {
   static final TransferService instance = TransferService._();
 
   HttpServer? _server;
+  String? _sessionToken;
+  int _authFailures = 0;
+  DateTime? _blockedUntil;
+  bool _payloadServed = false;
 
   bool get isHosting => _server != null;
 
@@ -44,116 +52,157 @@ class TransferService {
   }) async {
     await stopServer();
 
-    final payload = await buildPayload();
-
-    Future<shelf.Response> handler(
-      shelf.Request request,
-    ) async {
-      final path = '/${request.url.path}';
-      final given = request.url.queryParameters['code'] ?? '';
-
-      if (path == '/handshake' || path == '/payload') {
-        if (given != code) {
-          return shelf.Response(
-            401,
-            body: 'invalid code',
-          );
-        }
-      }
-
-      switch (path) {
-        case '/handshake':
-          return shelf.Response.ok(
-            jsonEncode({
-              'app': 'wallet',
-              'size': payload.length,
-            }),
-            headers: {
-              'content-type': 'application/json',
-            },
-          );
-
-        case '/payload':
-          var sent = 0;
-          const chunkSize = 64 * 1024;
-
-          final chunks = List.generate(
-            (payload.length / chunkSize).ceil(),
-            (index) {
-              final start = index * chunkSize;
-              final end = ((index + 1) * chunkSize).clamp(
-                0,
-                payload.length,
-              );
-
-              return payload.sublist(start, end);
-            },
-          );
-
-          final stream = Stream<List<int>>.fromIterable(
-            chunks,
-          ).map((chunk) {
-            sent += chunk.length;
-
-            if (payload.isNotEmpty) {
-              onProgress?.call(
-                sent / payload.length,
-              );
-            }
-
-            if (sent >= payload.length) {
-              onCompleted?.call();
-            }
-
-            return chunk;
-          });
-
-          return shelf.Response.ok(
-            stream,
-            headers: {
-              'content-type': 'application/octet-stream',
-              'content-length': '${payload.length}',
-            },
-          );
-
-        default:
-          return shelf.Response.notFound('no');
-      }
+    if (code.length != 6 || int.tryParse(code) == null) {
+      throw TransferException('Invalid transfer code.');
     }
 
-    try {
-      _server = await shelf_io.serve(
-        handler,
-        InternetAddress.anyIPv4,
-        kTransferPort,
-      );
-
-      _server!.autoCompress = false;
-    } on SocketException catch (e) {
-      throw TransferException(
-        'Could not start the transfer server '
-        '(${e.osError?.message ?? 'port busy'}).',
-      );
-    }
-
-    final ip = await localIp();
-
-    if (ip == null) {
-      await stopServer();
-
+    final bindIp = await localIp();
+    if (bindIp == null) {
       throw TransferException(
         'No Wi-Fi or hotspot connection found. '
         'Connect both phones to the same network.',
       );
     }
 
-    return ip;
+    final payload = await buildPayload();
+    if (payload.length > kMaxTransferBytes) {
+      throw TransferException('Transfer is too large to safely prepare.');
+    }
+
+    final sessionToken = _randomToken();
+    _sessionToken = sessionToken;
+    _authFailures = 0;
+    _blockedUntil = null;
+    _payloadServed = false;
+
+    Future<shelf.Response> handler(shelf.Request request) async {
+      if (request.method != 'GET') {
+        return shelf.Response(405, body: 'method not allowed');
+      }
+
+      final path = '/${request.url.path}';
+      if (path != '/handshake' && path != '/payload') {
+        return shelf.Response.notFound('no');
+      }
+
+      final now = DateTime.now();
+      if (_blockedUntil != null && now.isBefore(_blockedUntil!)) {
+        return shelf.Response(429, body: 'temporarily blocked');
+      }
+
+      final given = request.url.queryParameters['code'] ?? '';
+      if (!_constantTimeEquals(given, code)) {
+        _authFailures++;
+        if (_authFailures >= kMaxAuthFailures) {
+          _blockedUntil = now.add(kAuthBlockDuration);
+          _authFailures = 0;
+        }
+        return shelf.Response(401, body: 'invalid code');
+      }
+
+      // A successful handshake creates a short-lived capability token.
+      // The 6-digit code alone is never sufficient to download the payload.
+      if (path == '/payload') {
+        if (_payloadServed) {
+          return shelf.Response(410, body: 'transfer already completed');
+        }
+        final token = request.url.queryParameters['token'] ?? '';
+        if (!_constantTimeEquals(token, sessionToken)) {
+          return shelf.Response(403, body: 'invalid session');
+        }
+      }
+
+      _authFailures = 0;
+
+      if (path == '/handshake') {
+        return shelf.Response.ok(
+          jsonEncode({
+            'app': 'wallet',
+            'size': payload.length,
+            'token': sessionToken,
+          }),
+          headers: {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+          },
+        );
+      }
+
+      var sent = 0;
+      const chunkSize = 64 * 1024;
+      final stream = Stream<List<int>>.fromIterable(
+        <List<int>>[
+          for (var start = 0; start < payload.length; start += chunkSize)
+            payload.sublist(
+              start,
+              (start + chunkSize).clamp(0, payload.length),
+            ),
+        ],
+      ).map((chunk) {
+        sent += chunk.length;
+        if (payload.isNotEmpty) {
+          onProgress?.call(sent / payload.length);
+        }
+        if (sent >= payload.length) {
+          _payloadServed = true;
+          onCompleted?.call();
+        }
+        return chunk;
+      });
+
+      return shelf.Response.ok(
+        stream,
+        headers: {
+          'content-type': 'application/octet-stream',
+          'content-length': '${payload.length}',
+          'cache-control': 'no-store',
+        },
+      );
+    }
+
+    try {
+      _server = await shelf_io.serve(
+        handler,
+        InternetAddress(bindIp),
+        kTransferPort,
+      );
+      _server!.autoCompress = false;
+    } on SocketException catch (e) {
+      _sessionToken = null;
+      throw TransferException(
+        'Could not start the transfer server '
+        '(${e.osError?.message ?? 'port busy'}).',
+      );
+    }
+
+    return bindIp;
+  }
+
+  String _randomToken() {
+    final random = Random.secure();
+    final bytes = List<int>.generate(32, (_) => random.nextInt(256));
+    return base64UrlEncode(bytes).replaceAll('=', '');
+  }
+
+  bool _constantTimeEquals(String a, String b) {
+    final aa = utf8.encode(a);
+    final bb = utf8.encode(b);
+    var diff = aa.length ^ bb.length;
+    final length = aa.length < bb.length ? aa.length : bb.length;
+    for (var i = 0; i < length; i++) {
+      diff |= aa[i] ^ bb[i];
+    }
+    return diff == 0;
   }
 
   Future<void> stopServer() async {
     final server = _server;
 
     _server = null;
+    _sessionToken = null;
+    _authFailures = 0;
+    _blockedUntil = null;
+    _payloadServed = false;
 
     if (server != null) {
       try {
@@ -286,11 +335,20 @@ class TransferService {
             const Duration(milliseconds: 900),
           );
 
-      await response.drain<void>();
-
       if (response.statusCode == 200) {
-        return _ProbeResult.ok;
+        final body = await utf8.decoder.bind(response).join();
+        try {
+          final data = jsonDecode(body) as Map<String, dynamic>;
+          final token = data['token'];
+          if (token is String && token.isNotEmpty) {
+            _sessionToken = token;
+            return _ProbeResult.ok;
+          }
+        } catch (_) {}
+        return _ProbeResult.miss;
       }
+
+      await response.drain<void>();
 
       if (response.statusCode == 401) {
         return _ProbeResult.wrongCode;
@@ -316,9 +374,14 @@ class TransferService {
       ..connectionTimeout = const Duration(seconds: 8);
 
     try {
+      final token = _sessionToken;
+      if (token == null || token.isEmpty) {
+        throw TransferException('Transfer session expired. Start again.');
+      }
+
       final request = await client.getUrl(
         Uri.parse(
-          'http://$host:$kTransferPort/payload?code=$code',
+          'http://$host:$kTransferPort/payload?code=$code&token=${Uri.encodeQueryComponent(token)}',
         ),
       );
 
@@ -335,9 +398,15 @@ class TransferService {
       }
 
       final total = response.contentLength;
+      if (total > kMaxTransferBytes) {
+        throw TransferException('Transfer is too large to safely receive.');
+      }
       final bytes = <int>[];
 
       await for (final chunk in response) {
+        if (bytes.length + chunk.length > kMaxTransferBytes) {
+          throw TransferException('Transfer exceeded the safety limit.');
+        }
         bytes.addAll(chunk);
 
         if (total > 0) {
@@ -467,6 +536,46 @@ class TransferService {
         List<int>.from(manifestContent),
       ),
     ) as Map<String, dynamic>;
+
+    if (bytes.length > kMaxTransferBytes) {
+      throw TransferException('Transfer exceeded the safety limit.');
+    }
+
+    final documents = manifest['documents'];
+    if (documents is! List) {
+      throw TransferException('The received manifest is invalid.');
+    }
+
+    bool safePart(String value) =>
+        value.isNotEmpty &&
+        value != '.' &&
+        value != '..' &&
+        !value.contains('/') &&
+        !value.contains('\\') &&
+        !value.contains('..');
+
+    for (final raw in documents) {
+      if (raw is! Map) throw TransferException('The received manifest is invalid.');
+      final id = raw['id'];
+      if (id is! String || !safePart(id)) {
+        throw TransferException('The received manifest contains an unsafe document id.');
+      }
+    }
+
+    for (final file in archive.files) {
+      if (!file.isFile) continue;
+      final normalized = file.name.replaceAll('\\', '/');
+      if (normalized == 'manifest.json' || !normalized.startsWith('vault/')) {
+        if (normalized != 'manifest.json') {
+          throw TransferException('The received archive contains an unsafe path.');
+        }
+        continue;
+      }
+      final parts = normalized.split('/');
+      if (parts.length != 3 || !safePart(parts[1]) || !safePart(parts[2])) {
+        throw TransferException('The received archive contains an unsafe path.');
+      }
+    }
 
     final storage = StorageService.instance;
 

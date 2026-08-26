@@ -346,6 +346,7 @@ class NotificationService {
           playSound: true,
           enableVibration: true,
           enableLights: true,
+          visibility: NotificationVisibility.private,
           autoCancel: true,
         ),
         iOS: DarwinNotificationDetails(
@@ -513,6 +514,7 @@ class NotificationService {
           priority: Priority.high,
           playSound: true,
           enableVibration: true,
+          visibility: NotificationVisibility.private,
         ),
         iOS: DarwinNotificationDetails(),
       ),
@@ -551,6 +553,7 @@ class NotificationService {
         enableVibration: true,
         largeIcon: imageBitmap,
         styleInformation: imageStyle,
+        visibility: NotificationVisibility.private,
       ),
       iOS: const DarwinNotificationDetails(),
     );
@@ -667,7 +670,7 @@ class NotificationService {
         colorized: true,
         color: _lateColor,
         category: AndroidNotificationCategory.reminder,
-        visibility: NotificationVisibility.public,
+        visibility: NotificationVisibility.private,
         largeIcon: imageBitmap,
         styleInformation: imageStyle ??
             const BigTextStyleInformation(
